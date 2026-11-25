@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""
+Stock analyzer: enter a ticker, get key metrics plus charts with trend lines.
+
+Setup:   pip install yfinance pandas numpy matplotlib
+Usage:   python stock_analyzer.py DELL
+         python stock_analyzer.py AAPL --years 3
+
+Data comes from Yahoo Finance via yfinance (unofficial, free, can have gaps).
+This prints numbers and charts; it is not investment advice.
+"""
+import argparse
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib
+
+matplotlib.use("Agg")  # save to file; works without a display
+import matplotlib.pyplot as plt
+
+
+# ---------- formatting helpers ----------
+def num(v, d=2):
+    return "n/a" if v is None or (isinstance(v, float) and np.isnan(v)) else f"{v:,.{d}f}"
+
+
+def pct(v):
+    return "n/a" if v is None or (isinstance(v, float) and np.isnan(v)) else f"{v * 100:.2f}%"
+
+
+def big(v):
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return "n/a"
+    for unit, div in (("T", 1e12), ("B", 1e9), ("M", 1e6)):
+        if abs(v) >= div:
+            return f"${v / div:,.2f}{unit}"
+    return f"${v:,.0f}"
+
+
+def section(title, rows):
+    print(f"\n=== {title} ===")
+    for k, v in rows:
+        print(f"{k:<28}{v}")
+
+
+# ---------- trend / indicator helpers ----------
+def trendline(series):
+    """Least-squares straight line through a series. Returns (fitted values, slope per point)."""
+    s = series.dropna()
+    x = np.arange(len(s))
+    slope, intercept = np.polyfit(x, s.values, 1)
+    return pd.Series(intercept + slope * x, index=s.index), slope
+
+
+def rsi(close, n=14):
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    return 100 - 100 / (1 + gain / loss)
+
+
+def get_row(df, names):
+    for n in names:
+        if df is not None and not df.empty and n in df.index:
+            return df.loc[n].dropna().sort_index()
+    return None
+
+
+def bar_with_trend(ax, series, title):
+    if series is None or len(series) < 2:
+        ax.text(0.5, 0.5, "Not enough data", ha="center", va="center")
+        ax.set_title(title)
+        return
+    labels = [d.strftime("%Y") for d in series.index]
+    x = np.arange(len(series))
+    ax.bar(x, series.values / 1e9, color="#4C78A8")
+    slope, intercept = np.polyfit(x, series.values / 1e9, 1)
+    ax.plot(x, intercept + slope * x, "r--", lw=2, label=f"Trend ({slope:+.1f}B/yr)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_title(title)
+    ax.set_ylabel("USD billions")
+    ax.legend()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("ticker")
+    ap.add_argument("--years", type=int, default=5, help="years of price history")
+    args = ap.parse_args()
+
+    t = yf.Ticker(args.ticker.upper())
+    info = t.info or {}
+    name = info.get("longName", args.ticker.upper())
+
+    # ---------- metrics ----------
+    section(f"{name} ({args.ticker.upper()})", [
+        ("Price", num(info.get("currentPrice") or info.get("regularMarketPrice"))),
+        ("Market cap", big(info.get("marketCap"))),
+        ("52-week range", f"{num(info.get('fiftyTwoWeekLow'))} - {num(info.get('fiftyTwoWeekHigh'))}"),
+        ("Beta", num(info.get("beta"))),
+    ])
+    section("Valuation", [
+        ("Trailing P/E", num(info.get("trailingPE"))),
+        ("Forward P/E", num(info.get("forwardPE"))),
+        ("PEG ratio", num(info.get("trailingPegRatio") or info.get("pegRatio"))),
+        ("Price/Sales (TTM)", num(info.get("priceToSalesTrailing12Months"))),
+        ("Price/Book", num(info.get("priceToBook"))),
+        ("EV/Revenue", num(info.get("enterpriseToRevenue"))),
+        ("EV/EBITDA", num(info.get("enterpriseToEbitda"))),
+    ])
+    section("Profitability & growth", [
+        ("Gross margin", pct(info.get("grossMargins"))),
+        ("Operating margin", pct(info.get("operatingMargins"))),
+        ("Net margin", pct(info.get("profitMargins"))),
+        ("Return on equity", pct(info.get("returnOnEquity"))),
+        ("Revenue growth (yoy)", pct(info.get("revenueGrowth"))),
+        ("Earnings growth (yoy)", pct(info.get("earningsGrowth"))),
+        ("Trailing EPS", num(info.get("trailingEps"))),
+        ("Forward EPS", num(info.get("forwardEps"))),
+    ])
+    section("Balance sheet & cash", [
+        ("Total cash", big(info.get("totalCash"))),
+        ("Total debt", big(info.get("totalDebt"))),
+        ("Debt/Equity", num(info.get("debtToEquity"))),
+        ("Current ratio", num(info.get("currentRatio"))),
+        ("Operating cash flow", big(info.get("operatingCashflow"))),
+        ("Free cash flow", big(info.get("freeCashflow"))),
+    ])
+    section("Dividend", [
+        ("Dividend yield", pct(info.get("dividendYield") / 100 if info.get("dividendYield") and info.get("dividendYield") > 1 else info.get("dividendYield"))),
+        ("Payout ratio", pct(info.get("payoutRatio"))),
+    ])
+    section("Analysts", [
+        ("Recommendation", str(info.get("recommendationKey", "n/a"))),
+        ("# of analysts", str(info.get("numberOfAnalystOpinions", "n/a"))),
+        ("Target low / mean / high",
+         f"{num(info.get('targetLowPrice'))} / {num(info.get('targetMeanPrice'))} / {num(info.get('targetHighPrice'))}"),
+    ])
+
+    # ---------- price history & charts ----------
+    hist = t.history(period=f"{args.years}y")
+    if hist.empty:
+        print("\nNo price history returned; skipping charts.")
+        return
+    close = hist["Close"]
+    hist["MA50"] = close.rolling(50).mean()
+    hist["MA200"] = close.rolling(200).mean()
+    fit, slope = trendline(close)
+    per_year = slope * 252
+    last = close.iloc[-1]
+    print(f"\nPrice trendline slope: {per_year:+.2f} USD/year "
+          f"({per_year / last * 100:+.1f}% of current price per year)")
+    print(f"RSI(14): {rsi(close).iloc[-1]:.1f}  (>70 often read as overbought, <30 as oversold)")
+    if hist["MA50"].notna().any() and hist["MA200"].notna().any():
+        state = "above" if hist["MA50"].iloc[-1] > hist["MA200"].iloc[-1] else "below"
+        print(f"50-day average is {state} the 200-day average")
+
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    fig.suptitle(f"{name} ({args.ticker.upper()})", fontsize=15)
+
+    ax = axes[0, 0]
+    ax.plot(close.index, close, label="Close", lw=1.2)
+    ax.plot(hist.index, hist["MA50"], label="50-day avg", lw=1)
+    ax.plot(hist.index, hist["MA200"], label="200-day avg", lw=1)
+    ax.plot(fit.index, fit, "r--", lw=2, label=f"Trend ({per_year:+.1f}/yr)")
+    ax.set_title(f"Price, moving averages, trendline ({args.years}y)")
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+    ax = axes[0, 1]
+    r = rsi(close)
+    ax.plot(r.index, r, lw=1)
+    ax.axhline(70, color="r", ls="--", lw=1)
+    ax.axhline(30, color="g", ls="--", lw=1)
+    ax.set_ylim(0, 100)
+    ax.set_title("RSI (14)")
+    ax.grid(alpha=0.3)
+
+    rev = get_row(t.income_stmt, ["Total Revenue", "Operating Revenue"])
+    ni = get_row(t.income_stmt, ["Net Income", "Net Income Common Stockholders"])
+    bar_with_trend(axes[1, 0], rev, "Annual revenue with trend")
+    bar_with_trend(axes[1, 1], ni, "Annual net income with trend")
+
+    plt.tight_layout()
+    out = f"{args.ticker.upper()}_analysis.png"
+    plt.savefig(out, dpi=130)
+    print(f"\nChart saved to {out}")
+
+
+if __name__ == "__main__":
+    main()
